@@ -20,6 +20,15 @@
     "bridge",
     "relay"
   ],
+  "homepage": "https://github.com/LeonWong1983/ds-a2a-doorman#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LeonWong1983/ds-a2a-doorman.git",
+    "directory": "bundle/dsh-a2a-doorman"
+  },
+  "bugs": {
+    "url": "https://github.com/LeonWong1983/ds-a2a-doorman/issues"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
