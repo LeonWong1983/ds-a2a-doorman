@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Syntax-check the plugin and tools
+        run: |
+          node --check bundle/dsh-a2a-doorman/index.js
+          node --check tools/decode-zstd.mjs
+          node --check tools/install-a2a-relay-preset.mjs
+
+      - name: Validate package metadata and patch config
+        run: |
+          node -e "const p=require('./bundle/dsh-a2a-doorman/package.json'); if(!p.name||!p.version||!p.dsh?.bundle?.patch) { console.error('package.json missing dsh bundle metadata'); process.exit(1) } console.log('package.json ok:', p.name, p.version)"
+          node -e "
+            const fs=require('fs');
+            const y=fs.readFileSync('bundle/dsh-a2a-doorman/cordis.patch.yml','utf8');
+            for (const needle of ['- insert:','name: dsh-a2a-doorman','targetSession:']) {
+              if (!y.includes(needle)) { console.error('cordis.patch.yml missing:', needle); process.exit(1) }
+            }
+            console.log('cordis.patch.yml ok');
+          "
+
+      - name: Ensure no committed session logs or local secrets
+        run: |
+          if git ls-files | grep -E '\.jsonl$|\.jsonl\.zstd$|(^|/)\.env'; then
+            echo '::error::forbidden artifact is tracked'
+            exit 1
+          fi
+          if git grep -nE 'Bearer [A-Za-z0-9]{20,}|BEGIN [A-Z ]*PRIVATE KEY' -- . ':!*.md'; then
+            echo '::error::possible secret committed'
+            exit 1
+          fi
+          echo 'no forbidden artifacts'
