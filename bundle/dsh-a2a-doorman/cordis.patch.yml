@@ -1,0 +1,33 @@
+# dsh-a2a-doorman bundle patch.
+#
+# Install sequence:
+#   1. add this package to the web profile's dependencies (e.g. as a `file:` or
+#      git dependency) and to `dsh.profile.bundles`;
+#   2. set `targetSession` below to the id of the GUI session that should answer
+#      inbound A2A traffic;
+#   3. restart `dsh web` (host-plane plugins load at startup).
+#
+# Routing (optional multi-target): every relay picks the FIRST live session
+# among matching `routes`, then falls back to `targetSession`. Routes are
+# ordered; `textContains` matches the inbound text case-insensitively, while
+# `contextIdPrefix` / `contextIdExact` match the A2A context id when the relay
+# model passes one. A route whose target session is not currently open is
+# skipped rather than failing, so a stale route never breaks delivery.
+
+- insert:
+    - id: a2a-doorman
+      name: dsh-a2a-doorman
+      config:
+        # REQUIRED: the watched GUI session inbound A2A messages are relayed
+        # into. Find it in the GUI session URL / session list, e.g.
+        # "session-01234567-89ab-cdef-0123-456789abcdef".
+        targetSession: session-REPLACE-WITH-YOUR-SESSION-ID
+        # Deadline for one relayed turn in the target session (ms).
+        timeoutMs: 300000
+        # Which inbound sessions trigger relay (dsh-a2a session prefix).
+        sessionPrefix: a2a-
+        # Optional: send some traffic to a different session.
+        routes:
+          # Example: messages mentioning project-alpha go to its own session.
+          - textContains: [project-alpha]
+            targetSession: session-REPLACE-WITH-PROJECT-ALPHA-SESSION-ID
