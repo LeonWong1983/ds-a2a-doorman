@@ -1,5 +1,8 @@
 # ds-a2a-doorman
 
+[![CI](https://github.com/LeonWong1983/ds-a2a-doorman/actions/workflows/ci.yml/badge.svg)](https://github.com/LeonWong1983/ds-a2a-doorman/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **Bridge inbound [A2A](https://a2a-protocol.org/) messages into the DeepSeek Harness session you are actually watching — and send that session's reply back to the caller.**
 
 `dsh-a2a` already speaks A2A: it accepts `SendMessage` over JSON-RPC, runs each request in its own durable session, and returns the result. The catch is *where* it runs it: every inbound message is answered inside a throwaway `a2a-*` session, isolated from the GUI session a human is driving. The caller gets an answer from a session nobody is watching, and you never see the inbound message at all.
