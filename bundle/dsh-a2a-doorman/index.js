@@ -1,22 +1,23 @@
 /**
- * dsh-a2a-doorman — host-plane plugin registering the GLOBAL tool
- * `doorman_relay`, which the relay preset's agent model is instructed to call
- * for every inbound A2A message.
+ * dsh-a2a-doorman — host-plane plugin with two faces over one relay core:
  *
- * Why: `dsh-a2a` answers each inbound A2A `SendMessage` inside its own
- * throwaway `a2a-*` session, so the message never reaches the session a human
- * is actually watching. This plugin closes that gap: the relay session calls
- * `doorman_relay`, which injects the inbound text into a *watched* GUI session
- * as a normal user turn and returns that session's reply as the A2A result.
+ * 1. the GLOBAL tool `doorman_relay` (legacy path: a relay-preset agent model
+ *    calls it per inbound A2A message), and
+ * 2. the `a2aDoorman` service, whose `execute(request)` plugs straight into
+ *    `@ryubyte/dsh-a2a`'s inbound executor seat
+ *    (`- id: a2a` row, `config.execute`, executor priority #1). This is the
+ *    preferred path: the A2A task is handed to the watched session directly,
+ *    with no throwaway A2A session and no extra model hop.
  *
- * Tool semantics: inject `text` into the resolved target session as a fresh
- * user turn, wait for that session's driver to go idle, then return the
- * assistant text produced since the injection — so "the reply comes from the
- * target session".
+ * Why: an A2A server normally answers each inbound `SendMessage` inside its own
+ * session, so the message never reaches the session a human is actually
+ * watching. Both faces close that gap the same way: inject the inbound text
+ * into a *watched* GUI session as a normal user turn, wait for that session to
+ * go idle, and return the assistant text produced since the injection — so
+ * "the reply comes from the target session".
  *
  * Configuration (bundle patch `config`):
- * - `targetSession` (required): the default watched session id. The plugin does
- *   not register the tool when this is missing.
+ * - `targetSession` (required for the tool): the default watched session id.
  * - `timeoutMs` (optional, default 300000): deadline for one relayed turn.
  * - `routes` (optional): ordered multi-target routing table. Each entry is
  *   { contextIdPrefix? | contextIdExact? | textContains?[], targetSession }.
@@ -28,8 +29,7 @@
  *
  * Design notes:
  * - Runs on the host plane (bundle patch insert at profile root), so
- *   `ctx.tools.register` lands in the global layer — visible to every agent,
- *   including the dsh-a2a-created `a2a-*` sessions.
+ *   `ctx.tools.register` lands in the global layer — visible to every agent.
  * - Zero static imports on purpose: resolution of `@deepseek-ai/*` peers from a
  *   profile-local package is not guaranteed under the profile's pnpm layout, so
  *   the plugin talks to services through `ctx` and builds the user-message
@@ -37,8 +37,13 @@
  *   { id, role:'user', content:[{type:'text'}], source:{kind:'user'} }).
  * - Timeout DOES NOT cancel the target session: the target is a live GUI
  *   session a human may be driving, so aborting it mid-turn would destroy their
- *   work. On deadline the timeout is surfaced to the caller instead.
+ *   work. On deadline (or caller cancel) the condition is surfaced to the
+ *   caller instead.
+ * - Relays are serialized per A2A contextId, so two concurrent tasks for the
+ *   same conversation never interleave turns in the target session.
  */
+
+const SERVICE_NAME = 'a2aDoorman'
 
 export default {
   name: 'dsh-a2a-doorman',
@@ -49,12 +54,71 @@ export default {
     const TIMEOUT_MS = Number.isFinite(config.timeoutMs) ? config.timeoutMs : 300000
     const agents = ctx.get('agents')
     if (agents === undefined) {
-      ctx.logger?.warn?.('dsh-a2a-doorman: agents service unavailable; doorman_relay not registered')
+      ctx.logger?.warn?.('dsh-a2a-doorman: agents service unavailable; relay disabled')
       return
     }
+
+    /** One relayed turn: inject text, wait for idle, return the produced reply. */
+    const relay = async (text, contextId, signal) => {
+      const target = pickLiveTarget(agents, ROUTES, DEFAULT_TARGET, text, contextId)
+      if (target === undefined) {
+        const candidateIds = [
+          ...ROUTES.filter((r) => routeMatches(r, text, contextId)).map((r) => r.targetSession),
+          DEFAULT_TARGET,
+        ]
+        throw new Error(
+          `dsh-a2a-doorman: no live target session for relay (candidates: ${candidateIds.join(', ')})`,
+        )
+      }
+      const session = target.session
+      // 0.2.2+ removed the synchronous `events` array: use `seq` + `snapshotEvents()`.
+      // Keep the old path as a fallback so this bundle still runs on 0.2.1 runtimes.
+      const baseline =
+        typeof session.seq === 'number' ? session.seq : (session.events?.length ?? 0)
+      target.followup(userMessageLike(text))
+      await idleWithDeadline(target, TIMEOUT_MS, signal)
+      const produced =
+        typeof session.snapshotEvents === 'function'
+          ? session.snapshotEvents(baseline)
+          : (session.events ?? []).slice(baseline)
+      return collectReplyText(produced)
+    }
+
+    // Serialize per conversation: chain each relay behind its context's tail.
+    const tails = new Map()
+    const relaySerialized = (text, contextId, signal) => {
+      const key = contextId.length > 0 ? contextId : DEFAULT_TARGET
+      const prior = tails.get(key) ?? Promise.resolve()
+      const run = prior.catch(() => {}).then(() => relay(text, contextId, signal))
+      tails.set(key, run)
+      return run.finally(() => {
+        if (tails.get(key) === run) tails.delete(key)
+      })
+    }
+
+    // ── face 2: the inbound A2A executor seat ─────────────────────────────────
+    ctx.provide(SERVICE_NAME, {
+      relay: relaySerialized,
+      /** A2A executor contract: ({ message, contextId, signal }) → agent Message. */
+      async execute(request) {
+        const text = promptFromParts(request?.message?.parts)
+        if (text.length === 0) return agentMessage('No prompt provided.')
+        if (request?.signal?.aborted) return agentMessage('(canceled)')
+        try {
+          return agentMessage(await relaySerialized(text, String(request?.contextId ?? ''), request?.signal))
+        } catch (err) {
+          // Surface the reason as an artifact, like the built-in DSH executor
+          // does, instead of failing the task without explanation.
+          const reason = err?.message ?? String(err)
+          return agentMessage(reason.startsWith('dsh-a2a-doorman:') ? reason : `dsh-a2a-doorman: ${reason}`)
+        }
+      },
+    })
+
+    // ── face 1: the legacy global tool ────────────────────────────────────────
     if (DEFAULT_TARGET.length === 0) {
       ctx.logger?.warn?.(
-        'dsh-a2a-doorman: config.targetSession is not set; doorman_relay not registered',
+        'dsh-a2a-doorman: config.targetSession is not set; doorman_relay not registered (a2aDoorman service still available)',
       )
       return
     }
@@ -88,22 +152,7 @@ export default {
           async execute(args) {
             const text = String(args.text ?? '')
             if (text.trim().length === 0) throw new Error('dsh-a2a-doorman: empty relay text')
-            const contextId = String(args.contextId ?? '')
-            const target = pickLiveTarget(agents, ROUTES, DEFAULT_TARGET, text, contextId)
-            if (target === undefined) {
-              const candidateIds = [
-                ...ROUTES.filter((r) => routeMatches(r, text, contextId)).map((r) => r.targetSession),
-                DEFAULT_TARGET,
-              ]
-              throw new Error(
-                `dsh-a2a-doorman: no live target session for relay (candidates: ${candidateIds.join(', ')})`,
-              )
-            }
-            const baseline = target.session.events.length
-            target.followup(userMessageLike(text))
-            await idleWithDeadline(target, TIMEOUT_MS)
-            const produced = target.session.events.slice(baseline)
-            return collectReplyText(produced)
+            return relaySerialized(text, String(args.contextId ?? ''), undefined)
           },
         }),
       'a2a-doorman.doorman_relay',
@@ -118,7 +167,30 @@ function userMessageLike(text) {
   return { id, role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } }
 }
 
-function idleWithDeadline(agent, ms) {
+/** A2A agent message carrying just text (role string mirrors protocol Role.AGENT). */
+function agentMessage(text) {
+  return { messageId: newMessageId(), role: 'ROLE_AGENT', parts: [{ text }] }
+}
+
+function newMessageId() {
+  const uuid = globalThis.crypto?.randomUUID?.()
+  return uuid ?? `doorman-${Date.now().toString(36)}-${(seq += 1).toString(36)}`
+}
+
+/** Flatten A2A message parts into the prompt relayed to the target session. */
+function promptFromParts(parts) {
+  const out = []
+  for (const part of parts ?? []) {
+    if (typeof part?.text === 'string') out.push(part.text)
+    else if (part?.url !== undefined) out.push(String(part.url))
+    else if (part?.data !== undefined) {
+      out.push(typeof part.data === 'string' ? part.data : JSON.stringify(part.data))
+    } else if (part?.raw !== undefined) out.push(`[raw ${part.mediaType ?? 'bytes'} part]`)
+  }
+  return out.join('\n').trim()
+}
+
+function idleWithDeadline(agent, ms, signal) {
   let timer
   const deadline = new Promise((_, reject) => {
     timer = setTimeout(
@@ -126,7 +198,22 @@ function idleWithDeadline(agent, ms) {
       ms,
     )
   })
-  return Promise.race([agent.whenIdle(), deadline]).finally(() => clearTimeout(timer))
+  const races = [agent.whenIdle(), deadline]
+  if (signal !== undefined) {
+    races.push(
+      new Promise((_, reject) => {
+        if (signal.aborted) reject(new Error('dsh-a2a-doorman: relay canceled by caller'))
+        else {
+          signal.addEventListener(
+            'abort',
+            () => reject(new Error('dsh-a2a-doorman: relay canceled by caller')),
+            { once: true },
+          )
+        }
+      }),
+    )
+  }
+  return Promise.race(races).finally(() => clearTimeout(timer))
 }
 
 /** Assistant text blocks of the events produced during one relayed turn. */
