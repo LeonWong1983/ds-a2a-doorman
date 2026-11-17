@@ -1,7 +1,7 @@
 {
   "name": "dsh-a2a-doorman",
-  "version": "0.1.0",
-  "description": "A2A doorman: a global doorman_relay tool that bridges inbound A2A messages into a watched DeepSeek Harness session and returns that session's reply.",
+  "version": "0.1.1",
+  "description": "A2A doorman: relays inbound A2A messages into a watched DeepSeek Harness session and returns that session's reply (a2aDoorman executor seat for @ryubyte/dsh-a2a, plus the legacy doorman_relay tool).",
   "type": "module",
   "main": "index.js",
   "exports": {
